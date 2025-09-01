@@ -1,13 +1,12 @@
 import asyncio
 import aiohttp
 from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
-import json, os, time
+import json, os
 import docx2txt
 import PyPDF2
-import uvicorn
 
 app = FastAPI(title="Async Web Scraper API")
 
@@ -18,22 +17,17 @@ data = []
 bandwidth_used = 0
 BANDWIDTH_LIMIT = 1_073_741_824  # 1 GB in bytes
 WARNING_THRESHOLD = 900 * 1024 * 1024
-usage_file = "bandwidth_usage.json"
+# On Vercel you can’t persist a file, so keep usage in memory only
 
 
 def load_usage():
     global bandwidth_used
-    if os.path.exists(usage_file):
-        with open(usage_file, "r") as f:
-            try:
-                bandwidth_used = json.load(f).get("bytes", 0)
-            except:
-                bandwidth_used = 0
+    return bandwidth_used
 
 
 def save_usage():
-    with open(usage_file, "w") as f:
-        json.dump({"bytes": bandwidth_used}, f)
+    # No file saving on Vercel
+    pass
 
 
 # ---------- Proxy Loader ----------
@@ -55,13 +49,10 @@ def load_proxies(file_path="proxy_list.txt"):
 async def read_pdf(content):
     text = ""
     try:
-        with open("temp.pdf", "wb") as f:
-            f.write(content)
-        with open("temp.pdf", "rb") as f:
-            reader = PyPDF2.PdfReader(f)
-            for page in reader.pages:
-                text += page.extract_text() or ""
-        os.remove("temp.pdf")
+        from io import BytesIO
+        reader = PyPDF2.PdfReader(BytesIO(content))
+        for page in reader.pages:
+            text += page.extract_text() or ""
     except:
         pass
     return text
@@ -70,10 +61,13 @@ async def read_pdf(content):
 async def read_docx(content):
     text = ""
     try:
-        with open("temp.docx", "wb") as f:
-            f.write(content)
-        text = docx2txt.process("temp.docx")
-        os.remove("temp.docx")
+        from io import BytesIO
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
+            tmp.write(content)
+            tmp.flush()
+            text = docx2txt.process(tmp.name)
+        os.remove(tmp.name)
     except:
         pass
     return text
@@ -102,7 +96,6 @@ async def fetch(url, session, proxy=None):
             if resp.status == 200:
                 content = await resp.read()
                 bandwidth_used += len(content)
-                save_usage()
                 if bandwidth_used >= BANDWIDTH_LIMIT:
                     raise Exception("Bandwidth limit exceeded")
                 return content, resp.headers.get("Content-Type", "")
@@ -195,24 +188,18 @@ async def scrape_endpoint(
     result = await scrape_website(website_url, proxies, limit=number_of_pages)
 
     hostname = urlparse(website_url).netloc
-    output_file = f"{hostname}_scraped.json"
 
-    # Save scraped data into a JSON file
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump({"website": hostname, "data": result}, f, ensure_ascii=False, indent=2)
-
-    # Return JSON file as downloadable response
-    return FileResponse(
-        path=output_file,
-        media_type="application/json",
-        filename=output_file
-    )
+    # Return JSON directly (no file writes on Vercel)
+    return JSONResponse(content={
+        "website": hostname,
+        "pages_scraped": len(result),
+        "data": result
+    })
 
 
 @app.get("/bandwidth")
 async def bandwidth_status():
     """Return bandwidth usage in MB (used, remaining, total)."""
-    load_usage()
     used_mb = round(bandwidth_used / 1024 / 1024, 2)
     total_mb = round(BANDWIDTH_LIMIT / 1024 / 1024, 2)
     remaining_mb = round(total_mb - used_mb, 2)
@@ -221,8 +208,3 @@ async def bandwidth_status():
         "remaining_mb": remaining_mb,
         "total_mb": total_mb
     })
-
-
-# ---------- Auto-run with uvicorn ----------
-# if __name__ == "__main__":
-#     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
