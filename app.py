@@ -16,22 +16,7 @@ data = []
 # ---------- Bandwidth Tracker ----------
 bandwidth_used = 0
 BANDWIDTH_LIMIT = 1_073_741_824  # 1 GB in bytes
-usage_file = "bandwidth_usage.json"
-
-
-def load_usage():
-    global bandwidth_used
-    if os.path.exists(usage_file):
-        with open(usage_file, "r") as f:
-            try:
-                bandwidth_used = json.load(f).get("bytes", 0)
-            except:
-                bandwidth_used = 0
-
-
-def save_usage():
-    with open(usage_file, "w") as f:
-        json.dump({"bytes": bandwidth_used}, f)
+WARNING_THRESHOLD = 900 * 1024 * 1024
 
 
 # ---------- Proxy Loader ----------
@@ -100,7 +85,6 @@ async def fetch(url, session, proxy=None):
             if resp.status == 200:
                 content = await resp.read()
                 bandwidth_used += len(content)
-                save_usage()
                 if bandwidth_used >= BANDWIDTH_LIMIT:
                     raise Exception("Bandwidth limit exceeded")
                 return content, resp.headers.get("Content-Type", "")
@@ -115,14 +99,12 @@ async def worker(base_url, queue, session, proxy, limit):
     while True:
         url = await queue.get()
 
-        if url in visited:
-            queue.task_done()
-            continue
-        if limit is not None and len(data) >= limit:
+        if url in visited or (limit is not None and len(visited) >= limit):
             queue.task_done()
             continue
 
         visited.add(url)
+
         content, ctype = await fetch(url, session, proxy)
         text = ""
 
@@ -140,8 +122,7 @@ async def worker(base_url, queue, session, proxy, limit):
                 soup = BeautifulSoup(html, "html.parser")
                 text = soup.get_text(separator=" ", strip=True)
 
-                # Only enqueue new links if we still need more pages
-                if limit is None or len(data) < limit:
+                if limit is None or len(visited) < limit:
                     for a in soup.find_all("a", href=True):
                         link = urljoin(url, a["href"])
                         if urlparse(link).netloc == urlparse(base_url).netloc:
@@ -171,13 +152,8 @@ async def scrape_website(base_url, proxies, limit=None):
             task = asyncio.create_task(worker(base_url, queue, session, proxy, limit))
             tasks.append(task)
 
-        # Wait until enough pages are scraped or queue is empty
-        while True:
-            if limit is not None and len(data) >= limit:
-                break
-            if queue.empty():
-                break
-            await asyncio.sleep(0.5)
+        while not queue.empty() and (limit is None or len(visited) < limit):
+            await asyncio.sleep(1)
 
         await queue.join()
 
@@ -194,21 +170,19 @@ async def scrape_endpoint(
     number_of_pages: int | None = Query(None, description="Number of pages to scrape"),
     proxy: bool = Query(False, description="Enable proxy (requires proxy_list.txt)")
 ):
-    load_usage()
     proxies = load_proxies("proxy_list.txt") if proxy else []
     result = await scrape_website(website_url, proxies, limit=number_of_pages)
 
     hostname = urlparse(website_url).netloc
     return JSONResponse(content={
         "website": hostname,
-        "pages_scraped": len(result),
+        "total_pages": len(result),
         "data": result
     })
 
 
 @app.get("/bandwidth")
 async def bandwidth_status():
-    load_usage()
     used_mb = round(bandwidth_used / 1024 / 1024, 2)
     total_mb = round(BANDWIDTH_LIMIT / 1024 / 1024, 2)
     remaining_mb = round(total_mb - used_mb, 2)
