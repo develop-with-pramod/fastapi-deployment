@@ -115,8 +115,10 @@ async def worker(base_url, queue, session, proxy, limit):
     while True:
         url = await queue.get()
 
-        # Stop if enough pages collected
-        if url in visited or (limit is not None and len(data) >= limit):
+        if url in visited:
+            queue.task_done()
+            continue
+        if limit is not None and len(data) >= limit:
             queue.task_done()
             continue
 
@@ -138,7 +140,7 @@ async def worker(base_url, queue, session, proxy, limit):
                 soup = BeautifulSoup(html, "html.parser")
                 text = soup.get_text(separator=" ", strip=True)
 
-                # Enqueue new links only if limit not reached
+                # Only enqueue new links if we still need more pages
                 if limit is None or len(data) < limit:
                     for a in soup.find_all("a", href=True):
                         link = urljoin(url, a["href"])
@@ -169,8 +171,13 @@ async def scrape_website(base_url, proxies, limit=None):
             task = asyncio.create_task(worker(base_url, queue, session, proxy, limit))
             tasks.append(task)
 
-        while not queue.empty() and (limit is None or len(data) < limit):
-            await asyncio.sleep(1)
+        # Wait until enough pages are scraped or queue is empty
+        while True:
+            if limit is not None and len(data) >= limit:
+                break
+            if queue.empty():
+                break
+            await asyncio.sleep(0.5)
 
         await queue.join()
 
@@ -201,7 +208,6 @@ async def scrape_endpoint(
 
 @app.get("/bandwidth")
 async def bandwidth_status():
-    """Return bandwidth usage in MB (used, remaining, total)."""
     load_usage()
     used_mb = round(bandwidth_used / 1024 / 1024, 2)
     total_mb = round(BANDWIDTH_LIMIT / 1024 / 1024, 2)
