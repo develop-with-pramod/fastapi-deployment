@@ -16,18 +16,22 @@ data = []
 # ---------- Bandwidth Tracker ----------
 bandwidth_used = 0
 BANDWIDTH_LIMIT = 1_073_741_824  # 1 GB in bytes
-WARNING_THRESHOLD = 900 * 1024 * 1024
-# On Vercel you can’t persist a file, so keep usage in memory only
+usage_file = "bandwidth_usage.json"
 
 
 def load_usage():
     global bandwidth_used
-    return bandwidth_used
+    if os.path.exists(usage_file):
+        with open(usage_file, "r") as f:
+            try:
+                bandwidth_used = json.load(f).get("bytes", 0)
+            except:
+                bandwidth_used = 0
 
 
 def save_usage():
-    # No file saving on Vercel
-    pass
+    with open(usage_file, "w") as f:
+        json.dump({"bytes": bandwidth_used}, f)
 
 
 # ---------- Proxy Loader ----------
@@ -49,10 +53,13 @@ def load_proxies(file_path="proxy_list.txt"):
 async def read_pdf(content):
     text = ""
     try:
-        from io import BytesIO
-        reader = PyPDF2.PdfReader(BytesIO(content))
-        for page in reader.pages:
-            text += page.extract_text() or ""
+        with open("temp.pdf", "wb") as f:
+            f.write(content)
+        with open("temp.pdf", "rb") as f:
+            reader = PyPDF2.PdfReader(f)
+            for page in reader.pages:
+                text += page.extract_text() or ""
+        os.remove("temp.pdf")
     except:
         pass
     return text
@@ -61,13 +68,10 @@ async def read_pdf(content):
 async def read_docx(content):
     text = ""
     try:
-        from io import BytesIO
-        import tempfile
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
-            tmp.write(content)
-            tmp.flush()
-            text = docx2txt.process(tmp.name)
-        os.remove(tmp.name)
+        with open("temp.docx", "wb") as f:
+            f.write(content)
+        text = docx2txt.process("temp.docx")
+        os.remove("temp.docx")
     except:
         pass
     return text
@@ -96,6 +100,7 @@ async def fetch(url, session, proxy=None):
             if resp.status == 200:
                 content = await resp.read()
                 bandwidth_used += len(content)
+                save_usage()
                 if bandwidth_used >= BANDWIDTH_LIMIT:
                     raise Exception("Bandwidth limit exceeded")
                 return content, resp.headers.get("Content-Type", "")
@@ -110,13 +115,12 @@ async def worker(base_url, queue, session, proxy, limit):
     while True:
         url = await queue.get()
 
-        # Stop if limit reached
-        if url in visited or (limit is not None and len(visited) >= limit):
+        # Stop if enough pages collected
+        if url in visited or (limit is not None and len(data) >= limit):
             queue.task_done()
             continue
 
         visited.add(url)
-
         content, ctype = await fetch(url, session, proxy)
         text = ""
 
@@ -134,8 +138,8 @@ async def worker(base_url, queue, session, proxy, limit):
                 soup = BeautifulSoup(html, "html.parser")
                 text = soup.get_text(separator=" ", strip=True)
 
-                # Only enqueue new links if limit not reached
-                if limit is None or len(visited) < limit:
+                # Enqueue new links only if limit not reached
+                if limit is None or len(data) < limit:
                     for a in soup.find_all("a", href=True):
                         link = urljoin(url, a["href"])
                         if urlparse(link).netloc == urlparse(base_url).netloc:
@@ -165,7 +169,7 @@ async def scrape_website(base_url, proxies, limit=None):
             task = asyncio.create_task(worker(base_url, queue, session, proxy, limit))
             tasks.append(task)
 
-        while not queue.empty() and (limit is None or len(visited) < limit):
+        while not queue.empty() and (limit is None or len(data) < limit):
             await asyncio.sleep(1)
 
         await queue.join()
@@ -188,8 +192,6 @@ async def scrape_endpoint(
     result = await scrape_website(website_url, proxies, limit=number_of_pages)
 
     hostname = urlparse(website_url).netloc
-
-    # Return JSON directly (no file writes on Vercel)
     return JSONResponse(content={
         "website": hostname,
         "pages_scraped": len(result),
@@ -200,6 +202,7 @@ async def scrape_endpoint(
 @app.get("/bandwidth")
 async def bandwidth_status():
     """Return bandwidth usage in MB (used, remaining, total)."""
+    load_usage()
     used_mb = round(bandwidth_used / 1024 / 1024, 2)
     total_mb = round(BANDWIDTH_LIMIT / 1024 / 1024, 2)
     remaining_mb = round(total_mb - used_mb, 2)
