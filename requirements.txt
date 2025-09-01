@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+aiohttp
+beautifulsoup4
+docx2txt
+PyPDF2
